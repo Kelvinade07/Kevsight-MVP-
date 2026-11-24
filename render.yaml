@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: kevsight-mvp
+    name: kevsight
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
