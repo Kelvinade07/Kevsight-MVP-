@@ -1,16 +1,104 @@
 import io
 import os
 import re
+import hashlib
+import hmac
+import secrets
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import pdfplumber
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from starlette.middleware.sessions import SessionMiddleware
+from sqlalchemy import create_engine, String, Integer, DateTime, ForeignKey, JSON, Text, select, desc
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from pydantic import BaseModel
 
 app = FastAPI(title="Kevsight")
+
+# Configure DATABASE_URL in your local environment. Render production should use
+# a managed PostgreSQL database and its Internal Database URL.
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True) if DATABASE_URL else None
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False) if engine else None
+
+class Base(DeclarativeBase):
+    pass
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(256))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+class AnalysisRecord(Base):
+    __tablename__ = "analysis_records"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    source_name: Mapped[str] = mapped_column(String(255))
+    analyzed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    report: Mapped[dict] = mapped_column(JSON)
+
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.getenv("SESSION_SECRET", "local-development-secret-change-this-before-deployment"),
+    session_cookie="kevsight_session",
+    max_age=60 * 60 * 24 * 7,
+    same_site="lax",
+    https_only=os.getenv("COOKIE_SECURE", "false").lower() == "true",
+)
+
+@app.on_event("startup")
+async def initialise_database() -> None:
+    if engine is not None:
+        Base.metadata.create_all(bind=engine)
+
+
+def get_db():
+    if SessionLocal is None:
+        raise HTTPException(status_code=503, detail="Database is not configured. Set DATABASE_URL to your PostgreSQL connection string.")
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def password_digest(password: str, salt: bytes | None = None) -> str:
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310_000)
+    return f"pbkdf2_sha256${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        scheme, salt_hex, digest_hex = stored.split("$", 2)
+        if scheme != "pbkdf2_sha256":
+            return False
+        candidate = password_digest(password, bytes.fromhex(salt_hex)).split("$")[2]
+        return hmac.compare_digest(candidate, digest_hex)
+    except (ValueError, TypeError):
+        return False
+
+
+def authenticated_user(request: Request, db):
+    user_id = request.session.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Please sign in to continue.")
+    user = db.get(User, int(user_id))
+    if user is None:
+        request.session.clear()
+        raise HTTPException(status_code=401, detail="Your session has expired. Please sign in again.")
+    return user
 
 FEE_KEYWORDS = [
     "fee", "charge", "vat", "sms alert", "maintenance", "commission",
@@ -35,7 +123,6 @@ CATEGORY_RULES = {
     "Supplies & Inventory": ["inventory", "stock", "supplies", "wholesale", "vendor", "supplier"]
 }
 
-RECENT_HISTORY: List[Dict[str, Any]] = []
 MAX_HISTORY = 20
 
 
@@ -285,7 +372,7 @@ def analyze_transactions(
     top_cat_text = (
         f"Top outflow category is {categories[0]['category']} at {cur}{categories[0]['total_outflow']:,.2f}."
         if categories
-        else "No outflow categories recorded."
+        else "No outflow categories were identified in this dataset."
     )
     cash_status = "positive" if net_cash >= 0 else "negative"
 
@@ -312,17 +399,17 @@ def analyze_transactions(
     }
 
 
-def record_history(source_name: str, report: Dict[str, Any]) -> Dict[str, Any]:
-    entry = {
-        "id": f"run-{int(datetime.now(timezone.utc).timestamp() * 1000)}",
-        "source_name": source_name,
-        "analyzed_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "report": report,
+def record_history(db, user_id: int, source_name: str, report: Dict[str, Any]) -> Dict[str, Any]:
+    row = AnalysisRecord(user_id=user_id, source_name=source_name, report=report)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {
+        "id": str(row.id),
+        "source_name": row.source_name,
+        "analyzed_at": row.analyzed_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "report": row.report,
     }
-    RECENT_HISTORY.insert(0, entry)
-    if len(RECENT_HISTORY) > MAX_HISTORY:
-        del RECENT_HISTORY[MAX_HISTORY:]
-    return entry
 
 
 SAMPLE_TRANSACTIONS = [
@@ -342,15 +429,90 @@ async def health() -> JSONResponse:
     return JSONResponse({"status": "ok", "service": "kevsight"})
 
 
+@app.post("/api/auth/register")
+async def register(request: Request):
+    data = await request.json()
+    email = str(data.get("email", "")).strip().lower()
+    password = str(data.get("password", ""))
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(status_code=400, detail="Enter a valid email address.")
+    if len(password) < 10 or len(password) > 128:
+        raise HTTPException(status_code=400, detail="Password must be between 10 and 128 characters.")
+    db_gen = get_db()
+    db = next(db_gen)
+    try:
+        existing = db.scalar(select(User).where(User.email == email))
+        if existing:
+            raise HTTPException(status_code=409, detail="An account with this email already exists.")
+        user = User(email=email, password_hash=password_digest(password))
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        request.session.clear()
+        request.session["user_id"] = user.id
+        return {"ok": True, "user": {"email": user.email}}
+    finally:
+        db.close()
+
+
+@app.post("/api/auth/login")
+async def login(request: Request):
+    data = await request.json()
+    email = str(data.get("email", "")).strip().lower()
+    password = str(data.get("password", ""))
+    db_gen = get_db()
+    db = next(db_gen)
+    try:
+        user = db.scalar(select(User).where(User.email == email))
+        if user is None or not verify_password(password, user.password_hash):
+            raise HTTPException(status_code=401, detail="Email or password is incorrect.")
+        request.session.clear()
+        request.session["user_id"] = user.id
+        return {"ok": True, "user": {"email": user.email}}
+    finally:
+        db.close()
+
+
+@app.get("/api/auth/me")
+async def who_am_i(request: Request):
+    db_gen = get_db()
+    db = next(db_gen)
+    try:
+        user = authenticated_user(request, db)
+        return {"authenticated": True, "user": {"email": user.email}}
+    finally:
+        db.close()
+
+
+@app.post("/api/auth/logout")
+async def logout(request: Request):
+    request.session.clear()
+    return {"ok": True}
+
+
 @app.get("/api/history")
-async def get_history() -> JSONResponse:
-    return JSONResponse({"items": RECENT_HISTORY})
+async def get_history(request: Request):
+    db_gen = get_db()
+    db = next(db_gen)
+    try:
+        user = authenticated_user(request, db)
+        rows = db.scalars(select(AnalysisRecord).where(AnalysisRecord.user_id == user.id).order_by(desc(AnalysisRecord.analyzed_at)).limit(MAX_HISTORY)).all()
+        return {"items": [{"id": str(r.id), "source_name": r.source_name, "analyzed_at": r.analyzed_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), "report": r.report} for r in rows]}
+    finally:
+        db.close()
 
 
 @app.delete("/api/history")
-async def clear_history() -> JSONResponse:
-    RECENT_HISTORY.clear()
-    return JSONResponse({"ok": True})
+async def clear_history(request: Request):
+    db_gen = get_db()
+    db = next(db_gen)
+    try:
+        user = authenticated_user(request, db)
+        db.query(AnalysisRecord).filter(AnalysisRecord.user_id == user.id).delete(synchronize_session=False)
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -726,10 +888,24 @@ async def home() -> str:
     @media (max-width:390px) {
       .grid-4 { grid-template-columns:1fr; }
     }
+
+    .landing{max-width:1180px;margin:0 auto;padding:0 28px;color:#17152a}.landing-nav{height:82px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #e9e6f1}.landing-brand{display:flex;align-items:center;gap:11px;color:#19152d;text-decoration:none;font-weight:850;font-size:21px}.landing-brand .brand-mark{display:grid;place-items:center;width:38px;height:38px;border-radius:12px;background:#5b21b6;color:white}.landing-nav-note{font-size:13px;color:#777187}.landing-signin{background:white!important;color:#5120a5!important;border:1px solid #ded6ed!important;padding:10px 20px!important}.hero{display:grid;grid-template-columns:1.05fr .95fr;gap:65px;align-items:center;padding:74px 0 82px}.hero-copy .eyebrow,.landing-features small,.auth-intro>small{font-size:11px;font-weight:850;letter-spacing:.15em;color:#6b36bb}.hero h1{font-size:clamp(42px,5.3vw,66px);line-height:1.06;letter-spacing:-.055em;margin:19px 0;color:#19152d}.hero h1 em{font-style:normal;color:#6936b7}.hero-copy>p{font-size:16px;line-height:1.8;color:#69647a;max-width:550px}.hero-actions{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin:28px 0 20px}.hero-actions button,.auth-submit{background:#5b21b6;color:white;border:0;border-radius:10px;padding:14px 22px;font-weight:750}.hero-actions span{font-size:11px;color:#817b90}.hero-proof{display:flex;gap:19px;flex-wrap:wrap;color:#615b70;font-size:12px}.preview-card{background:#fff;border:1px solid #e9e5f0;border-radius:20px;padding:25px;box-shadow:0 22px 65px #33204d12;transform:rotate(1deg)}.preview-top{display:flex;justify-content:space-between;align-items:center}.preview-top small,.preview-kpis small,.chart-title{font-size:10px;letter-spacing:.08em;color:#817a91;font-weight:750}.preview-top h3{margin:7px 0 0;font-size:19px}.live-pill{font-size:9px;color:#16804b;background:#e8f7ee;padding:7px 9px;border-radius:20px}.preview-kpis{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:24px 0}.preview-kpis>div{background:#f8f6fb;border-radius:12px;padding:15px}.preview-kpis strong{display:block;font-size:25px;margin:8px 0 4px;letter-spacing:-.04em}.preview-kpis span{font-size:10px;color:#817a91}.positive{color:#16804b}.chart-title{display:flex;justify-content:space-between;margin:20px 0 12px}.chart-title small{font-weight:500;letter-spacing:0}.mini-chart{height:145px;display:flex;gap:13px;border-bottom:1px solid #eae6f0;background:repeating-linear-gradient(to bottom,transparent 0,transparent 35px,#f0edf5 36px)}.chart-y{display:flex;flex-direction:column;justify-content:space-between;color:#9992a6;font-size:9px;padding-bottom:5px}.chart-bars{flex:1;display:flex;align-items:end;justify-content:space-around;gap:10px;padding:0 5px}.chart-bars i{display:block;flex:1;max-width:30px;border-radius:5px 5px 0 0;background:linear-gradient(180deg,#9564d8,#5b21b6)}.chart-months{display:flex;justify-content:space-around;margin:8px 0;color:#8c8599;font-size:9px}.preview-foot{display:flex;justify-content:space-between;border-top:1px solid #eeeaf3;padding-top:15px;margin-top:17px;color:#696278;font-size:10px}.landing-features{padding:60px 0;border-top:1px solid #eae6f0}.landing-features h2,.auth-intro h2{font-size:34px;letter-spacing:-.04em;margin:12px 0 28px}.feature-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}.feature-grid article{background:#fff;border:1px solid #ebe7f1;border-radius:15px;padding:23px}.feature-grid b{color:#7949bd;font-size:12px}.feature-grid h3{margin:14px 0 8px}.feature-grid p{font-size:13px;line-height:1.7;color:#777187;margin:0}.auth-section{display:grid;grid-template-columns:1fr 430px;gap:60px;align-items:center;padding:75px 8%;margin:25px 0;background:#f2eef9;border-radius:22px}.auth-intro h2{line-height:1.15}.auth-intro p{color:#716b7e;line-height:1.7;max-width:390px}.auth-assurance{font-size:11px;color:#655d74;margin-top:24px}.auth-card{background:#fff;padding:27px;border:1px solid #e7e1ef;border-radius:17px;box-shadow:0 12px 35px #24133c0b}.auth-tabs{display:flex;gap:8px;border-bottom:1px solid #eeeaf3;margin-bottom:22px}.auth-tab{background:transparent!important;color:#81798e!important;border:0!important;border-bottom:2px solid transparent!important;border-radius:0!important;padding:10px 13px!important}.auth-tab.active{color:#5722ad!important;border-bottom-color:#5722ad!important}.auth-card label{display:block;font-size:12px;font-weight:700;margin:14px 0 7px}.auth-card input{width:100%;height:44px;border:1px solid #e2ddea;border-radius:9px;padding:0 12px;font:inherit}.auth-hint{font-size:11px;color:#80798e;line-height:1.5}.auth-error{font-size:12px;color:#b42318;min-height:16px}.auth-submit{width:100%;margin-top:5px}.landing-footer{display:flex;justify-content:space-between;padding:22px 0 30px;color:#888195;font-size:11px}.container header .header-actions{display:flex;gap:8px;flex-wrap:wrap}
+    @media(max-width:850px){.hero{grid-template-columns:1fr;gap:36px;padding:55px 0}.preview-card{max-width:600px;width:100%;transform:none}.auth-section{grid-template-columns:1fr;gap:25px;padding:38px 25px}.auth-card{max-width:500px;width:100%}}
+    @media(max-width:600px){.landing{padding:0 16px}.landing-nav{height:68px}.landing-nav-note{display:none}.hero h1{font-size:43px}.feature-grid{grid-template-columns:1fr}.landing-features h2,.auth-intro h2{font-size:28px}.preview-card{padding:17px}.preview-kpis strong{font-size:21px}.landing-footer{gap:12px;flex-wrap:wrap}.auth-section{padding:30px 17px}}
+
   </style>
 </head>
 <body>
-  <div class="container">
+  <main class="landing" id="landingPage">
+    <nav class="landing-nav"><a class="landing-brand" href="#top"><span class="brand-mark">K</span><span>Kevsight</span></a><span class="landing-nav-note">Financial clarity for growing businesses</span><button class="landing-signin" id="navSignIn">Sign in</button></nav>
+    <section class="hero" id="top"><div class="hero-copy"><div class="eyebrow">BUSINESS INTELLIGENCE, MADE CLEAR</div><h1>See your numbers.<br><em>Understand your business.</em></h1><p>Bring sales and financial data into one clear workspace. Track performance, understand cash flow and turn business records into practical insights.</p><div class="hero-actions"><button id="heroGetStarted">Create free account</button><span>Simple email registration · Your own private workspace</span></div><div class="hero-proof"><span>✓ Sales performance</span><span>✓ Cash-flow visibility</span><span>✓ Financial insights</span></div></div>
+      <div class="preview-card"><div class="preview-top"><div><small>WORKSPACE OVERVIEW</small><h3>Business snapshot</h3></div><span class="live-pill">● SAMPLE VIEW</span></div><div class="preview-kpis"><div><small>Total sales</small><strong>₦8.42m</strong><span>Across selected period</span></div><div><small>Net cash flow</small><strong class="positive">₦2.16m</strong><span>Illustrative data</span></div></div><div class="chart-title">Monthly performance <small>Illustrative</small></div><div class="mini-chart"><div class="chart-y"><span>10m</span><span>5m</span><span>0</span></div><div class="chart-bars"><i style="height:38%"></i><i style="height:52%"></i><i style="height:44%"></i><i style="height:69%"></i><i style="height:61%"></i><i style="height:84%"></i><i style="height:74%"></i><i style="height:96%"></i></div></div><div class="chart-months"><span>Jan</span><span>Feb</span><span>Mar</span><span>Apr</span><span>May</span><span>Jun</span><span>Jul</span><span>Aug</span></div><div class="preview-foot"><span>Sales trends</span><span>Category insights</span><span>Financial reports</span></div></div></section>
+    <section class="landing-features"><div><small>ONE WORKSPACE</small><h2>From raw records to confident decisions.</h2></div><div class="feature-grid"><article><b>01</b><h3>Sales analytics</h3><p>Explore revenue, product performance, customer patterns and trends from your business datasets.</p></article><article><b>02</b><h3>Financial statement insights</h3><p>Build a clearer view of profitability, financial position, cash flows and key ratios from company reports.</p></article><article><b>03</b><h3>Business dashboards</h3><p>Bring important metrics, charts and findings together in a practical management view.</p></article></div></section>
+    <section class="auth-section" id="authSection"><div class="auth-intro"><small>GET STARTED WITH KEVSIGHT</small><h2>Your business numbers,<br>in one place.</h2><p>Create an account to keep your analysis history connected to your private workspace.</p><div class="auth-assurance">Your account is protected with password hashing and a secure session cookie.</div></div><div class="auth-card"><div class="auth-tabs"><button class="auth-tab active" id="loginTab">Sign in</button><button class="auth-tab" id="registerTab">Create account</button></div><form id="authForm"><label for="authEmail">Email address</label><input id="authEmail" type="email" autocomplete="email" placeholder="you@company.com" required><label for="authPassword">Password</label><input id="authPassword" type="password" autocomplete="current-password" minlength="10" placeholder="At least 10 characters" required><p class="auth-hint" id="authHint">Welcome back. Sign in to open your workspace.</p><p class="auth-error" id="authError" role="alert"></p><button class="auth-submit" type="submit" id="authSubmit">Sign in to Kevsight</button></form></div></section>
+    <footer class="landing-footer"><span>© 2026 Kevsight</span><span>Finance &amp; Sales Data Intelligence</span></footer>
+  </main>
+
+  <div class="container" id="appShell" style="display:none;">
     <header>
       <div class="brand-wrap">
         <div class="brand-mark">K</div>
@@ -741,6 +917,7 @@ async def home() -> str:
       <div class="header-actions">
         <button type="button" class="ghost" id="themeBtn" aria-label="Toggle theme">Dark Mode</button>
         <button type="button" id="sampleBtn">Try Sample Data</button>
+        <button type="button" class="ghost" id="logoutBtn">Sign out</button>
       </div>
     </header>
 
@@ -839,10 +1016,10 @@ async def home() -> str:
 
         <div class="card" style="margin-bottom:0;">
           <div class="section-head">
-            <h2 class="section-title">Plain-English Brief</h2>
+            <h2 class="section-title">Key Findings</h2>
           </div>
           <ul class="brief-list" id="briefList">
-            <li>Click <strong>Try Sample Data</strong> or upload a file and click <strong>Analyze Data</strong>.</li>
+            <li>Your analysis summary will appear here after you load sample data or analyse a file.</li>
           </ul>
           <div class="flag-box" id="flagBox" style="display:none;">
             <div class="flag-title">Flagged Fees &amp; Potential Duplicates</div>
@@ -948,7 +1125,7 @@ async def home() -> str:
         </div>
         <div class="faq-item">
           <div class="faq-q">Can I analyze sales data as well as bank/expense statements?</div>
-          <div class="hint" style="margin:0;">Yes. Positive amounts or credit rows are treated as inflows/sales, while outflows are grouped into categories, checked for fees/duplicates, and summarized in plain English.</div>
+          <div class="hint" style="margin:0;">Yes. Positive amounts or credit rows are treated as inflows/sales, while outflows are grouped into categories, checked for fees/duplicates, and included in the analysis summary.</div>
         </div>
         <div class="faq-item">
           <div class="faq-q">Why does the free deployment sometimes take a moment on first load?</div>
@@ -961,6 +1138,56 @@ async def home() -> str:
   <div class="toast" id="toast"></div>
 
   <script>
+    let authMode = "login";
+    const landingPage = document.getElementById("landingPage");
+    const appShell = document.getElementById("appShell");
+    function setAuthMode(mode) {
+      authMode = mode;
+      document.getElementById("loginTab").classList.toggle("active", mode === "login");
+      document.getElementById("registerTab").classList.toggle("active", mode === "register");
+      document.getElementById("authSubmit").textContent = mode === "login" ? "Sign in to Kevsight" : "Create my account";
+      document.getElementById("authHint").textContent = mode === "login" ? "Welcome back. Sign in to open your workspace." : "Use a valid email and a password of at least 10 characters.";
+      document.getElementById("authPassword").autocomplete = mode === "login" ? "current-password" : "new-password";
+      document.getElementById("authError").textContent = "";
+    }
+    function showWorkspace(email) {
+      landingPage.style.display = "none";
+      appShell.style.display = "block";
+      const brand = document.getElementById("brandDisplay");
+      if (brand) brand.textContent = "Kevsight";
+      const sub = document.querySelector(".brand-sub");
+      if (sub) sub.textContent = email;
+      loadHistoryFromServer();
+    }
+    async function checkSession() {
+      try {
+        const res = await fetch("/api/auth/me");
+        if (res.ok) { const data = await res.json(); showWorkspace(data.user.email); }
+      } catch (_) {}
+    }
+    document.getElementById("loginTab").addEventListener("click", () => setAuthMode("login"));
+    document.getElementById("registerTab").addEventListener("click", () => setAuthMode("register"));
+    document.getElementById("navSignIn").addEventListener("click", () => document.getElementById("authSection").scrollIntoView({behavior:"smooth"}));
+    document.getElementById("heroGetStarted").addEventListener("click", () => { setAuthMode("register"); document.getElementById("authSection").scrollIntoView({behavior:"smooth"}); });
+    document.getElementById("authForm").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const button = document.getElementById("authSubmit");
+      const error = document.getElementById("authError");
+      button.disabled = true; button.textContent = authMode === "login" ? "Signing in..." : "Creating account..."; error.textContent = "";
+      try {
+        const response = await fetch(`/api/auth/${authMode === "login" ? "login" : "register"}`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({email:document.getElementById("authEmail").value, password:document.getElementById("authPassword").value})});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Could not complete your request.");
+        showWorkspace(data.user.email);
+      } catch (err) { error.textContent = err.message || "Unable to connect. Please try again."; }
+      finally { button.disabled = false; button.textContent = authMode === "login" ? "Sign in to Kevsight" : "Create my account"; }
+    });
+    document.getElementById("logoutBtn").addEventListener("click", async () => {
+      await fetch("/api/auth/logout", {method:"POST"});
+      location.reload();
+    });
+    checkSession();
+
     const SETTINGS_KEY = "kevsight_settings_v1";
     const LOCAL_HISTORY_KEY = "kevsight_history_v1";
 
@@ -1007,6 +1234,16 @@ async def home() -> str:
 
     function saveLocalHistory() {
       localStorage.setItem(LOCAL_HISTORY_KEY, JSON.stringify(localHistory.slice(0, 20)));
+    }
+
+    async function loadHistoryFromServer() {
+      try {
+        const response = await fetch("/api/history");
+        if (!response.ok) return;
+        const data = await response.json();
+        localHistory = Array.isArray(data.items) ? data.items : [];
+        renderHistory();
+      } catch (_) {}
     }
 
     // Escape all uploaded/user-provided text before inserting it into HTML.
@@ -1165,11 +1402,11 @@ async def home() -> str:
       const topCat = cats[0];
       const cashStatus = net >= 0 ? "positive" : "negative";
       const briefLines = [
-        `Net cash flow is ${cashStatus} at ${fmt(net, cur)} (${fmt(inflow, cur)} inflow vs. ${fmt(outflow, cur)} outflow).`,
+        `Net cash flow: ${fmt(net, cur)}. Total inflows: ${fmt(inflow, cur)}; total outflows: ${fmt(outflow, cur)}.`,
         topCat
-          ? `Top outflow category is ${topCat.category} at ${fmt(topCat.total_outflow, cur)}.`
-          : "No outflow categories recorded.",
-        `Flagged ${s.flagged_items_count || 0} fee/duplicate item(s) totaling ${fmt(s.flagged_total || 0, cur)} for review.`
+          ? `Largest outflow category: ${topCat.category} (${fmt(topCat.total_outflow, cur)}).`
+          : "No outflow categories were identified in this dataset.",
+        `Items requiring review: ${s.flagged_items_count || 0}, with a combined value of ${fmt(s.flagged_total || 0, cur)}.`
       ];
       briefLines.forEach((line) => {
         const li = document.createElement("li");
@@ -1378,18 +1615,28 @@ async def home() -> str:
 
 
 @app.get("/api/sample")
-async def sample_analysis(currency: str = "₦", check_duplicates: bool = True) -> JSONResponse:
-    report = analyze_transactions(SAMPLE_TRANSACTIONS, currency=currency, check_duplicates=check_duplicates)
-    record_history("Sample Dataset", report)
-    return JSONResponse(report)
+async def sample_analysis(request: Request, currency: str = "₦", check_duplicates: bool = True) -> JSONResponse:
+    db_gen = get_db()
+    db = next(db_gen)
+    try:
+        user = authenticated_user(request, db)
+        report = analyze_transactions(SAMPLE_TRANSACTIONS, currency=currency, check_duplicates=check_duplicates)
+        record_history(db, user.id, "Sample Dataset", report)
+        return JSONResponse(report)
+    finally:
+        db.close()
 
 
 @app.post("/api/analyze")
 async def analyze_upload(
+    request: Request,
     file: UploadFile = File(...),
     currency: str = "₦",
     check_duplicates: bool = True,
 ) -> JSONResponse:
+    db_gen = get_db()
+    db = next(db_gen)
+    user = authenticated_user(request, db)
     filename = file.filename or "upload.csv"
     allowed_extensions = {".csv", ".xlsx", ".xls", ".pdf"}
     extension = os.path.splitext(filename.lower())[1]
@@ -1417,5 +1664,6 @@ async def analyze_upload(
         )
 
     report = analyze_transactions(transactions, currency=currency, check_duplicates=check_duplicates)
-    record_history(filename, report)
+    record_history(db, user.id, filename, report)
+    db.close()
     return JSONResponse(report)
